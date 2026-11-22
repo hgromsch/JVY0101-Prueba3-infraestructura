@@ -1,0 +1,396 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Respirar y Soltar (EP3) - API Gateway (REST) como puerta unica de entrada al backend:
+  exige API key, aplica throttling y cuota por plan de uso, y agrega la cabecera secreta
+  X-Origin-Verify que el edge del cluster exige (sin ella responde 403).
+
+Parameters:
+  Proyecto:
+    Type: String
+    Default: rys
+  ManagerIp:
+    Type: String
+    Description: IP elastica del manager del cluster Swarm (edge nginx en el puerto 80)
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    Description: Secreto compartido entre el API Gateway y el edge del cluster
+
+Resources:
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${Proyecto}-api"
+      Description: Respirar y Soltar - API publica (todas las rutas requieren x-api-key)
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      ApiKeySourceType: HEADER
+
+  # Respuestas de error del gateway en JSON y en espanol
+  RespuestaApiKeyInvalida:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: INVALID_API_KEY
+      StatusCode: "403"
+      ResponseTemplates:
+        application/json: '{"status":403,"error":"Forbidden","mensaje":"API key invalida o ausente (cabecera x-api-key)","requestId":"$context.requestId"}'
+  RespuestaSinAutenticacion:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: MISSING_AUTHENTICATION_TOKEN
+      StatusCode: "403"
+      ResponseTemplates:
+        application/json: '{"status":403,"error":"Forbidden","mensaje":"Ruta inexistente o sin credencial","requestId":"$context.requestId"}'
+  RespuestaLimite:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: THROTTLED
+      StatusCode: "429"
+      ResponseTemplates:
+        application/json: '{"status":429,"error":"Too Many Requests","mensaje":"Limite de peticiones del plan de uso superado","requestId":"$context.requestId"}'
+  RespuestaCuota:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: QUOTA_EXCEEDED
+      StatusCode: "429"
+      ResponseTemplates:
+        application/json: '{"status":429,"error":"Too Many Requests","mensaje":"Cuota diaria del plan de uso agotada","requestId":"$context.requestId"}'
+
+  # GET /salud -> salud del edge del cluster
+  RecursoSalud:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: salud
+  MetodoSalud:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoSalud
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Sub "http://${ManagerIp}/salud"
+        TimeoutInMillis: 10000
+
+  # /identidad/{proxy+} -> ms-identidad
+  RecursoIdentidad:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: identidad
+  RecursoIdentidadProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoIdentidad
+      PathPart: "{proxy+}"
+  MetodoIdentidad:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoIdentidadProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/identidad/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /psicologos/{proxy+} -> ms-psicologos
+  RecursoPsicologos:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: psicologos
+  RecursoPsicologosProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoPsicologos
+      PathPart: "{proxy+}"
+  MetodoPsicologos:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoPsicologosProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/psicologos/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /agenda/{proxy+} -> ms-agenda
+  RecursoAgenda:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: agenda
+  RecursoAgendaProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoAgenda
+      PathPart: "{proxy+}"
+  MetodoAgenda:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoAgendaProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/agenda/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /talleres/{proxy+} -> ms-talleres
+  RecursoTalleres:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: talleres
+  RecursoTalleresProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoTalleres
+      PathPart: "{proxy+}"
+  MetodoTalleres:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoTalleresProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/talleres/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /pagos/{proxy+} -> ms-pagos
+  RecursoPagos:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: pagos
+  RecursoPagosProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoPagos
+      PathPart: "{proxy+}"
+  MetodoPagos:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoPagosProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/pagos/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /clinico/{proxy+} -> ms-clinico
+  RecursoClinico:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: clinico
+  RecursoClinicoProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoClinico
+      PathPart: "{proxy+}"
+  MetodoClinico:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoClinicoProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/clinico/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  # /notificaciones/{proxy+} -> ms-notificaciones
+  RecursoNotificaciones:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: notificaciones
+  RecursoNotificacionesProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref RecursoNotificaciones
+      PathPart: "{proxy+}"
+  MetodoNotificaciones:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref RecursoNotificacionesProxy
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${ManagerIp}/notificaciones/{proxy}"
+        TimeoutInMillis: 29000
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.X-Origin-Verify: !Sub "'${OriginSecret}'"
+          integration.request.header.X-Request-Id: context.requestId
+
+  Despliegue:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - MetodoSalud
+      - MetodoIdentidad
+      - MetodoPsicologos
+      - MetodoAgenda
+      - MetodoTalleres
+      - MetodoPagos
+      - MetodoClinico
+      - MetodoNotificaciones
+    Properties:
+      RestApiId: !Ref Api
+      Description: Despliegue inicial
+
+  EtapaProd:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Despliegue
+      StageName: prod
+      Description: Produccion
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+
+  # Dos clientes con su propia API key: la app/Postman y la funcion serverless
+  ApiKeyClientes:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${Proyecto}-clientes"
+      Description: Frontend web/movil y pruebas (Postman)
+      Enabled: true
+  ApiKeyFuncion:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${Proyecto}-fn-confirmacion-cita"
+      Description: Funcion Lambda fn-confirmacion-cita
+      Enabled: true
+
+  PlanDeUso:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: EtapaProd
+    Properties:
+      UsagePlanName: !Sub "${Proyecto}-plan-estandar"
+      Description: 50 req/s (rafaga 100) y 20.000 peticiones diarias por API key
+      ApiStages:
+        - ApiId: !Ref Api
+          Stage: prod
+      Throttle:
+        RateLimit: 50
+        BurstLimit: 100
+      Quota:
+        Limit: 20000
+        Period: DAY
+  PlanClaveClientes:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyClientes
+      KeyType: API_KEY
+      UsagePlanId: !Ref PlanDeUso
+  PlanClaveFuncion:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyFuncion
+      KeyType: API_KEY
+      UsagePlanId: !Ref PlanDeUso
+
+Outputs:
+  ApiId:
+    Value: !Ref Api
+  ApiUrl:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export: {Name: !Sub "${Proyecto}-api-url"}
+  ApiKeyClientesId:
+    Value: !Ref ApiKeyClientes
+  ApiKeyFuncionId:
+    Value: !Ref ApiKeyFuncion
+    Export: {Name: !Sub "${Proyecto}-api-key-funcion-id"}
