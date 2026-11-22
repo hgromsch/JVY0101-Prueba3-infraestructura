@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Respirar y Soltar (EP3) - Servicios cloud que usa el sistema: base de datos (Amazon RDS
+  PostgreSQL), cola (Amazon SQS + cola de mensajes fallidos), almacenamiento (Amazon S3 para
+  comprobantes y artefactos) y registro de imagenes (Amazon ECR, un repositorio por microservicio).
+
+Parameters:
+  Proyecto:
+    Type: String
+    Default: rys
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Type: AWS::EC2::Subnet::Id
+  SubnetB:
+    Type: AWS::EC2::Subnet::Id
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Clave del usuario maestro de PostgreSQL (viene del secret DB_PASSWORD del pipeline)
+  DbClase:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small]
+
+Resources:
+  # ------------------------------------------------------------------ Base de datos
+  SgBaseDatos:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL de Respirar y Soltar - solo desde los nodos del cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: PostgreSQL desde el cluster Swarm
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: "${Proyecto}-sg-cluster"
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-sg-bd"}
+
+  GrupoSubredesBd:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subredes de la base de datos (2 zonas)
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+
+  BaseDatos:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete                # laboratorio; en produccion: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${Proyecto}-postgres"
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: !Ref DbClase
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: respirar
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref GrupoSubredesBd
+      VPCSecurityGroups: [!Ref SgBaseDatos]
+      PubliclyAccessible: false           # solo accesible desde dentro de la VPC
+      MultiAZ: false                      # en produccion: true (replica sincronica en otra zona)
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-postgres"}
+
+  # ------------------------------------------------------------------ Cola
+  # Requerimiento asincrono: al reservar una cita (RF-04) el paciente recibe su confirmacion
+  # (RF-10) sin que la reserva espere al envio. ms-agenda produce; la Lambda consume.
+  ColaCitasDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Proyecto}-citas-eventos-dlq"
+      MessageRetentionPeriod: 1209600     # 14 dias para revisar y reprocesar los fallidos
+      SqsManagedSseEnabled: true
+
+  ColaCitas:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Proyecto}-citas-eventos"
+      MessageRetentionPeriod: 345600      # 4 dias: si la Lambda esta caida, los eventos esperan
+      VisibilityTimeout: 120              # >= 6 x timeout de la Lambda (20 s)
+      ReceiveMessageWaitTimeSeconds: 20   # long polling: menos llamadas vacias
+      SqsManagedSseEnabled: true          # cifrado en reposo
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ColaCitasDlq.Arn
+        maxReceiveCount: 3                # 3 intentos fallidos -> DLQ (no se pierde el mensaje)
+
+  # ------------------------------------------------------------------ Almacenamiento
+  BucketComprobantes:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${Proyecto}-comprobantes-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-comprobantes
+            Status: Enabled
+            ExpirationInDays: 365
+
+  BucketArtefactos:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${Proyecto}-artefactos-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-artefactos
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ------------------------------------------------------------------ Registro de imagenes
+  EcrIdentidad:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-identidad
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrPsicologos:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-psicologos
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrAgenda:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-agenda
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrTalleres:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-talleres
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrPagos:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-pagos
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrClinico:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-clinico
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  EcrNotificaciones:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: rys/ms-notificaciones
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}   # analisis de vulnerabilidades al subir
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Conserva las 10 imagenes mas recientes","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt BaseDatos.Endpoint.Address
+  ColaCitasUrl:
+    Value: !Ref ColaCitas
+    Export: {Name: !Sub "${Proyecto}-cola-citas-url"}
+  ColaCitasArn:
+    Value: !GetAtt ColaCitas.Arn
+    Export: {Name: !Sub "${Proyecto}-cola-citas-arn"}
+  ColaCitasDlqUrl:
+    Value: !Ref ColaCitasDlq
+  BucketComprobantes:
+    Value: !Ref BucketComprobantes
+    Export: {Name: !Sub "${Proyecto}-bucket-comprobantes"}
+  BucketArtefactos:
+    Value: !Ref BucketArtefactos
+    Export: {Name: !Sub "${Proyecto}-bucket-artefactos"}
+  RegistroEcr:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
