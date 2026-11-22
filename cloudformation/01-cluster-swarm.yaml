@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Respirar y Soltar (EP3) - Nodos del cluster Docker Swarm: 1 manager + 2 workers en
+  2 zonas de disponibilidad, grupo de seguridad del cluster e IP elastica del manager.
+  Compatible con AWS Academy Learner Lab (usa LabInstanceProfile, no crea roles IAM).
+
+Parameters:
+  Proyecto:
+    Type: String
+    Default: rys
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Par de llaves para entrar por SSH (lo crea scripts/01-provisionar.sh)
+  TipoInstancia:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subred publica en la zona A (manager y worker-2)
+  SubnetB:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subred publica en la zona B (worker-1)
+  CidrSsh:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Origen permitido para SSH (los runners de GitHub Actions no tienen IP fija)
+
+Resources:
+  SgCluster:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Nodos Docker Swarm de Respirar y Soltar
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH (despliegue desde el pipeline y administracion)
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref CidrSsh
+        - Description: HTTP del edge nginx (solo responde a peticiones firmadas por el API Gateway)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-sg-cluster"}
+
+  # Trafico interno del Swarm entre nodos: 2377/tcp (gestion), 7946/tcp+udp (gossip),
+  # 4789/udp (VXLAN overlay) y protocolo 50 ESP (overlay cifrada).
+  SgClusterGestion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgCluster
+      Description: Swarm - gestion del cluster
+      IpProtocol: tcp
+      FromPort: 2377
+      ToPort: 2377
+      SourceSecurityGroupId: !Ref SgCluster
+  SgClusterGossipTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgCluster
+      Description: Swarm - descubrimiento de nodos (tcp)
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SgCluster
+  SgClusterGossipUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgCluster
+      Description: Swarm - descubrimiento de nodos (udp)
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SgCluster
+  SgClusterVxlan:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgCluster
+      Description: Swarm - red overlay VXLAN
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref SgCluster
+  SgClusterEsp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgCluster
+      Description: Swarm - overlay cifrada (IPSec ESP)
+      IpProtocol: "50"
+      SourceSecurityGroupId: !Ref SgCluster
+
+  PlantillaNodo:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${Proyecto}-nodo-swarm"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref TipoInstancia
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: LabInstanceProfile          # da a los contenedores acceso a SQS/ECR sin llaves
+        SecurityGroupIds: [!Ref SgCluster]
+        MetadataOptions:
+          HttpTokens: required              # solo IMDSv2
+          HttpPutResponseHopLimit: 2        # +1 salto para que los contenedores lleguen al IMDS
+          InstanceMetadataTags: enabled     # el user data lee el tag Name para el hostname
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            NOMBRE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Name)
+            hostnamectl set-hostname "$NOMBRE"
+            dnf install -y docker
+            systemctl enable --now docker
+            usermod -aG docker ec2-user
+            # Rotacion de logs de los contenedores a nivel de daemon
+            echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' > /etc/docker/daemon.json
+            systemctl restart docker
+            touch /var/lib/cloud/instance/docker-listo
+
+  Manager:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PlantillaNodo
+        Version: !GetAtt PlantillaNodo.LatestVersionNumber
+      SubnetId: !Ref SubnetA
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-manager"}
+        - {Key: RolSwarm, Value: manager}
+
+  Worker1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PlantillaNodo
+        Version: !GetAtt PlantillaNodo.LatestVersionNumber
+      SubnetId: !Ref SubnetB
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-worker-1"}
+        - {Key: RolSwarm, Value: worker}
+
+  Worker2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PlantillaNodo
+        Version: !GetAtt PlantillaNodo.LatestVersionNumber
+      SubnetId: !Ref SubnetA
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-worker-2"}
+        - {Key: RolSwarm, Value: worker}
+
+  # IP fija del manager: el API Gateway apunta aqui y sobrevive a los reinicios del lab
+  IpManager:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Manager
+      Tags:
+        - {Key: Name, Value: !Sub "${Proyecto}-ip-manager"}
+
+Outputs:
+  ManagerIpPublica:
+    Value: !Ref IpManager
+    Export: {Name: !Sub "${Proyecto}-manager-ip"}
+  ManagerIpPrivada:
+    Value: !GetAtt Manager.PrivateIp
+  Worker1IpPublica:
+    Value: !GetAtt Worker1.PublicIp
+  Worker1IpPrivada:
+    Value: !GetAtt Worker1.PrivateIp
+  Worker2IpPublica:
+    Value: !GetAtt Worker2.PublicIp
+  Worker2IpPrivada:
+    Value: !GetAtt Worker2.PrivateIp
+  ZonaManager:
+    Value: !GetAtt Manager.AvailabilityZone
+  ZonaWorker1:
+    Value: !GetAtt Worker1.AvailabilityZone
+  ZonaWorker2:
+    Value: !GetAtt Worker2.AvailabilityZone
+  SgClusterId:
+    Value: !Ref SgCluster
+    Export: {Name: !Sub "${Proyecto}-sg-cluster"}
