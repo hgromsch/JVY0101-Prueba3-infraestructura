@@ -1,0 +1,165 @@
+# Pipeline de infraestructura (EP3, IE4/IE5/IE7)
+#   1. validar         → cfn-lint de las plantillas, docker compose config y nginx -t
+#   2. provisionar     → CloudFormation: clúster EC2 (Swarm), RDS + SQS/DLQ + S3 + ECR, API Gateway
+#   3. configurar      → inicia el Swarm (manager + workers + etiquetas) y crea las bases de datos en RDS
+#   4. desplegar-stack → secretos de Swarm + docker stack deploy del sistema completo
+#   5. prueba-humo     → salud de los 7 microservicios a través del API Gateway
+# Se ejecuta con push a main que toque la infraestructura, o a mano (Actions → Run workflow).
+name: Infraestructura
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloudformation/**"
+      - "docker-compose.yml"
+      - "edge/**"
+      - "postgres/**"
+      - "scripts/**"
+      - ".github/workflows/infraestructura.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infraestructura
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  SSH_KEY: /home/runner/.ssh/rys-swarm.pem
+
+jobs:
+  validar:
+    name: 1 · Validar definiciones
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cfn-lint (plantillas CloudFormation)
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint cloudformation/*.yaml
+      - name: docker compose config (stack de Swarm)
+        run: |
+          REGISTRY=000000000000.dkr.ecr.us-east-1.amazonaws.com DB_HOST=db SQS_COLA_CITAS_URL=https://sqs \
+            docker compose -f docker-compose.yml config --quiet && echo "docker-compose.yml válido"
+      - name: nginx -t (configuración del edge)
+        run: |
+          printf 'map $http_x_origin_verify $origen_valido { default 0; "x" 1; }\n' > /tmp/origen.conf
+          docker run --rm -v "$PWD/edge/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            -v /tmp/origen.conf:/run/secrets/origen.conf:ro --add-host ms-agenda:127.0.0.1 nginx:1.27-alpine nginx -t
+      - name: Sintaxis de los scripts
+        run: for s in scripts/*.sh; do bash -n "$s"; done
+
+  provisionar:
+    name: 2 · Provisionar servicios cloud (CloudFormation)
+    needs: validar
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: produccion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Llave SSH del clúster
+        run: |
+          mkdir -p ~/.ssh && echo "${{ secrets.SWARM_SSH_KEY }}" > "$SSH_KEY" && chmod 600 "$SSH_KEY"
+      - name: Clúster EC2 (1 manager + 2 workers, 2 zonas, IP elástica)
+        run: ./scripts/01-provisionar.sh cluster
+      - name: Base de datos RDS, cola SQS + DLQ, buckets S3 y repositorios ECR
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: ./scripts/01-provisionar.sh servicios
+      - name: API Gateway (API key, plan de uso, cabecera de origen)
+        env:
+          ORIGIN_SECRET: ${{ secrets.ORIGIN_SECRET }}
+        run: ./scripts/01-provisionar.sh api
+      - name: Resumen de recursos
+        run: |
+          {
+            echo "### Recursos provisionados"
+            for s in rys-cluster rys-servicios rys-api; do
+              echo "**$s**"; echo '```'
+              aws cloudformation describe-stacks --stack-name $s --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  configurar:
+    name: 3 · Configurar clúster Swarm y base de datos
+    needs: provisionar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Llave SSH del clúster
+        run: mkdir -p ~/.ssh && echo "${{ secrets.SWARM_SSH_KEY }}" > "$SSH_KEY" && chmod 600 "$SSH_KEY"
+      - name: docker swarm init + join de workers + etiquetas de nodos
+        run: ./scripts/02-iniciar-swarm.sh
+      - name: Crear las 7 bases de datos en RDS
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: ./scripts/04-configurar-bd.sh
+
+  desplegar-stack:
+    name: 4 · docker stack deploy
+    needs: configurar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Llave SSH del clúster
+        run: mkdir -p ~/.ssh && echo "${{ secrets.SWARM_SSH_KEY }}" > "$SSH_KEY" && chmod 600 "$SSH_KEY"
+      - name: Secretos de Swarm + despliegue del stack rys
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          ORIGIN_SECRET: ${{ secrets.ORIGIN_SECRET }}
+          CLINICO_CRYPTO_KEY: ${{ secrets.CLINICO_CRYPTO_KEY }}
+          PAGOS_WEBHOOK_SECRET: ${{ secrets.PAGOS_WEBHOOK_SECRET }}
+        run: ./scripts/05-desplegar-stack.sh
+      - name: Estado del clúster
+        run: ./scripts/estado.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  prueba-humo:
+    name: 5 · Prueba de humo vía API Gateway
+    needs: desplegar-stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Salud de cada microservicio
+        run: |
+          API_URL=$(aws cloudformation describe-stacks --stack-name rys-api --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          KEY_ID=$(aws cloudformation describe-stacks --stack-name rys-api --query "Stacks[0].Outputs[?OutputKey=='ApiKeyClientesId'].OutputValue" --output text)
+          API_KEY=$(aws apigateway get-api-key --api-key "$KEY_ID" --include-value --query value --output text)
+          echo "::add-mask::$API_KEY"
+          echo "Sin API key → $(curl -s -o /dev/null -w '%{http_code}' $API_URL/salud) (esperado 403)"
+          for s in identidad psicologos agenda talleres pagos clinico notificaciones; do
+            ok=""
+            for i in $(seq 1 30); do
+              curl -fs -H "x-api-key: $API_KEY" "$API_URL/$s/actuator/health" | grep -q '"UP"' && ok=1 && break
+              sleep 10
+            done
+            [ -n "$ok" ] && echo "✅ ms-$s UP" | tee -a "$GITHUB_STEP_SUMMARY" || { echo "❌ ms-$s" ; exit 1; }
+          done
