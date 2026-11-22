@@ -31,14 +31,19 @@ en "$MANAGER" "cd ~/rys && aws ecr get-login-password --region $AWS_REGION | doc
   && REGISTRY=$REGISTRY TAG=$TAG DB_HOST=$DB_HOST SQS_COLA_CITAS_URL=$COLA EDGE_CONF_VERSION=$(shasum "$RAIZ/edge/nginx.conf" | cut -c1-10) \
      docker stack deploy -c docker-compose.yml --with-registry-auth --prune rys"
 
-info "Esperando que todas las réplicas queden corriendo (máx. 10 min)"
+info "Esperando que todas las réplicas y actualizaciones terminen (máx. 15 min)"
 en "$MANAGER" 'bash -s' <<'REMOTO'
-for i in $(seq 1 60); do
+estado_updates() { for s in $(docker stack services rys -q); do
+  echo "$(docker service inspect "$s" --format '{{.Spec.Name}} {{if .UpdateStatus}}{{.UpdateStatus.State}}{{else}}ok{{end}}')"; done; }
+for i in $(seq 1 90); do
   pendientes=$(docker stack services rys --format '{{.Name}} {{.Replicas}}' | awk '{split($2,r,"/"); if (r[1]!=r[2]) print $1" "$2}')
-  [ -z "$pendientes" ] && break
-  echo "  esperando: $(echo $pendientes | tr '\n' ' ')"; sleep 10
+  actualizando=$(estado_updates | grep -E ' (updating|rollback_started)$' || true)
+  [ -z "$pendientes$actualizando" ] && break
+  echo "  esperando: $(echo $pendientes $actualizando | tr '\n' ' ')"; sleep 10
 done
 docker stack services rys
+fallidos=$(estado_updates | grep -E ' (rollback_completed|rollback_paused|paused)$' || true)
+if [ -n "$fallidos" ]; then echo "✖ Actualización revertida por Swarm (rollback): $fallidos"; exit 1; fi
 [ -z "$pendientes" ]
 REMOTO
 ok "Stack desplegado y convergido"

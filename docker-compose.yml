@@ -63,7 +63,8 @@ x-entorno-db: &entorno-db
   DB_HOST: ${DB_HOST:-postgres}
   DB_PORT: "5432"
   DB_USERNAME: respirar
-  DB_POOL_SIZE: "4"
+  DB_POOL_SIZE: "4"                 # máximo por réplica (réplicas x 4 <= 81 conexiones de RDS db.t3.micro)
+  DB_POOL_MIN: "1"                  # en reposo, 1 conexión por réplica
   TZ: America/Santiago
 
 services:
