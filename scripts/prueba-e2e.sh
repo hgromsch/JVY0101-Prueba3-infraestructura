@@ -29,15 +29,18 @@ PSICO_ID=$(echo "$PSICO" | campo "['id']"); echo "  $PSICO"
 info "3 · Reserva de la cita en ms-agenda (productor de la cola)"
 HORARIO=$(python3 -c "import datetime as d; print((d.datetime.now()+d.timedelta(days=3)).replace(minute=0,second=0,microsecond=0).isoformat())")
 T0=$(python3 -c 'import time; print(time.time())')
-CITA=$(api -X POST "$API_URL/agenda/api/citas" -d "{\"pacienteId\":\"$PACIENTE_ID\",\"psicologoId\":\"$PSICO_ID\",\"horario\":\"$HORARIO\"}")
+RESERVA="{\"pacienteId\":\"$PACIENTE_ID\",\"psicologoId\":\"$PSICO_ID\",\"horario\":\"$HORARIO\"}"
+CITA=$(api -X POST "$API_URL/agenda/api/citas" -d "$RESERVA")
 CITA_ID=$(echo "$CITA" | campo "['id']"); echo "  $CITA"
-echo "  Doble reserva del mismo horario → $(api -o /dev/null -w '%{http_code}' -X POST "$API_URL/agenda/api/citas" -d "{\"pacienteId\":\"$PACIENTE_ID\",\"psicologoId\":\"$PSICO_ID\",\"horario\":\"$HORARIO\"}") (esperado 409)"
+DOBLE=$(api -X POST "$API_URL/agenda/api/citas" -d "$RESERVA")
+echo "  Doble reserva del mismo horario → $DOBLE"
 
 info "4 · Consumidor: la Lambda procesa el evento (comprobante en S3 + notificación)"
-for i in $(seq 1 30); do
+for i in $(seq 1 45); do
   CLAVE=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "comprobantes/$CITA_ID/" --query 'Contents[0].Key' --output text 2>/dev/null)
-  [[ "$CLAVE" != None && -n "$CLAVE" ]] && break; sleep 2
+  [[ "$CLAVE" != None && -n "$CLAVE" ]] && break; sleep 1
 done
+[[ "$CLAVE" != None && -n "$CLAVE" ]] || error "La Lambda no generó el comprobante (revise: aws logs tail /aws/lambda/rys-fn-confirmacion-cita)"
 T1=$(python3 -c 'import time; print(time.time())')
 echo "  Comprobante: s3://$BUCKET/$CLAVE  (en $(python3 -c "print(round($T1-$T0,1))") s desde la reserva)"
 NOTIF=$(api "$API_URL/notificaciones/api/notificaciones?destinatario=camila.$SUFIJO@correo.cl")

@@ -48,7 +48,7 @@ jobs:
             docker compose -f docker-compose.yml config --quiet && echo "docker-compose.yml válido"
       - name: nginx -t (configuración del edge)
         run: |
-          printf 'map $http_x_origin_verify $origen_valido { default 0; "x" 1; }\n' > /tmp/origen.conf
+          printf 'map $http_x_origin_verify $origen_valido { default 0; "%s" 1; }\n' "$(openssl rand -hex 24)" > /tmp/origen.conf
           docker run --rm -v "$PWD/edge/nginx.conf:/etc/nginx/nginx.conf:ro" \
             -v /tmp/origen.conf:/run/secrets/origen.conf:ro --add-host ms-agenda:127.0.0.1 nginx:1.27-alpine nginx -t
       - name: Sintaxis de los scripts
