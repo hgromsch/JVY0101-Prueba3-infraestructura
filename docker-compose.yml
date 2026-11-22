@@ -238,8 +238,9 @@ volumes:
 
 configs:
   edge_nginx_conf:
-    # Los configs de Swarm son inmutables: al cambiar nginx.conf se sube EDGE_CONF_VERSION
-    name: rys_edge_nginx_v${EDGE_CONF_VERSION:-1}
+    # Los configs de Swarm son inmutables: el nombre lleva el hash del archivo, así cada
+    # cambio de nginx.conf crea un config nuevo y el edge se actualiza con rolling update
+    name: rys_edge_nginx_${EDGE_CONF_VERSION:-local}
     file: ./edge/nginx.conf
 
 secrets:
