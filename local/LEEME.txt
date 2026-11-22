@@ -1,0 +1,2 @@
+Secretos de DESARROLLO para `docker compose up` en el equipo local. No sirven en la nube:
+en el clúster los secretos se crean desde los secrets del pipeline (scripts/05-desplegar-stack.sh).

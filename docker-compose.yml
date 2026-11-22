@@ -1,0 +1,255 @@
+# =============================================================================
+#  Respirar y Soltar — stack de Docker Swarm (EP3, IE3 / IE7)
+#
+#  Un solo archivo sirve para los dos entornos:
+#    · Clúster Swarm en AWS:  docker stack deploy -c docker-compose.yml --with-registry-auth rys
+#    · Local (desarrollo):    docker compose up -d --build
+#      (docker compose carga además docker-compose.override.yml: construye las imágenes
+#       desde los repos vecinos, agrega PostgreSQL local y publica los puertos 8081-8087)
+#
+#  Variables que se interpolan al desplegar (las exporta scripts/05-desplegar-stack.sh):
+#    REGISTRY             registro ECR  (<cuenta>.dkr.ecr.us-east-1.amazonaws.com)
+#    TAG                  etiqueta de las imágenes (latest o el SHA del commit)
+#    DB_HOST              endpoint de Amazon RDS PostgreSQL
+#    SQS_COLA_CITAS_URL   URL de la cola SQS rys-citas-eventos
+# =============================================================================
+
+# --- Bloques reutilizables (anclas YAML) -------------------------------------
+x-despliegue-ms: &despliegue-ms
+  replicas: 2                       # 2 réplicas por defecto: si un nodo cae, el servicio sigue
+  placement:
+    preferences:
+      - spread: node.labels.zona     # reparte las réplicas entre zonas de disponibilidad
+    constraints:
+      - node.labels.rol == app       # los microservicios corren en los 3 nodos (todos tienen rol=app)
+  update_config:                    # rolling update sin corte: levanta la nueva antes de bajar la vieja
+    parallelism: 1
+    delay: 10s
+    order: start-first
+    monitor: 60s
+    failure_action: rollback        # si la nueva versión no queda healthy, vuelve sola a la anterior
+  rollback_config:
+    parallelism: 1
+    order: stop-first
+  restart_policy:
+    condition: any
+    delay: 5s
+    window: 60s
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 600M
+    reservations:
+      cpus: "0.10"
+      memory: 320M
+
+x-ms-base: &ms-base
+  networks:
+    - backend
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  secrets:
+    # El secreto se monta como /run/secrets/spring.datasource.password y Spring lo lee
+    # con spring.config.import=configtree:/run/secrets/ (nunca queda en variables de entorno)
+    - source: rys_db_password
+      target: spring.datasource.password
+      mode: 0400
+      uid: "10001"
+
+x-entorno-db: &entorno-db
+  DB_HOST: ${DB_HOST:-postgres}
+  DB_PORT: "5432"
+  DB_USERNAME: respirar
+  DB_POOL_SIZE: "4"
+  TZ: America/Santiago
+
+services:
+  # --------------------------- Microservicios -------------------------------
+  ms-identidad:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-identidad:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+    deploy: *despliegue-ms
+
+  ms-psicologos:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-psicologos:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+    deploy: *despliegue-ms
+
+  ms-agenda:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-agenda:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+      REDIS_HOST: redis
+      # Productor de la cola: publica CITA_RESERVADA/REPROGRAMADA/CANCELADA.
+      # Credenciales: rol de la instancia EC2 (IMDSv2), no hay llaves en el contenedor.
+      SQS_COLA_CITAS_URL: ${SQS_COLA_CITAS_URL:-}
+      AWS_REGION: us-east-1
+    deploy:
+      <<: *despliegue-ms
+      replicas: 3                    # servicio más demandado (reservas en horario punta)
+
+  ms-talleres:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-talleres:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+      REDIS_HOST: redis
+    deploy: *despliegue-ms
+
+  ms-pagos:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-pagos:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+    secrets:
+      - source: rys_db_password
+        target: spring.datasource.password
+        mode: 0400
+        uid: "10001"
+      - source: rys_pagos_webhook_secret
+        target: PAGOS_WEBHOOK_SECRET
+        mode: 0400
+        uid: "10001"
+    deploy: *despliegue-ms
+
+  ms-clinico:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-clinico:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+      # En el clúster el servicio NO arranca sin la clave real de cifrado de las notas
+      CLINICO_PERMITIR_CLAVE_DESARROLLO: "false"
+    secrets:
+      - source: rys_db_password
+        target: spring.datasource.password
+        mode: 0400
+        uid: "10001"
+      - source: rys_clinico_crypto_key
+        target: CLINICO_CRYPTO_KEY
+        mode: 0400
+        uid: "10001"
+    deploy: *despliegue-ms
+
+  ms-notificaciones:
+    <<: *ms-base
+    image: ${REGISTRY:-local}/rys/ms-notificaciones:${TAG:-latest}
+    environment:
+      <<: *entorno-db
+    deploy: *despliegue-ms
+
+  # --------------------------- Infraestructura ------------------------------
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    networks:
+      - backend
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.datos == true   # siempre en el mismo nodo: el volumen con los datos vive ahí
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 192M
+
+  # Punto de entrada del clúster: SOLO acepta peticiones que vienen del API Gateway
+  # (cabecera X-Origin-Verify con el secreto compartido) y las enruta por prefijo.
+  edge:
+    image: nginx:1.27-alpine
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: ingress                # routing mesh: cualquier nodo recibe y balancea
+    networks:
+      - backend
+    configs:
+      - source: edge_nginx_conf
+        target: /etc/nginx/nginx.conf
+    secrets:
+      - source: rys_origin_secret_map
+        target: origen.conf
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/salud"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.labels.zona
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 64M
+
+  # Vista gráfica del clúster (qué tarea corre en qué nodo). Solo por túnel SSH:
+  #   ssh -i ~/.ssh/rys-swarm.pem -L 8090:localhost:8090 ec2-user@<IP_MANAGER>
+  visualizador:
+    image: dockersamples/visualizer:latest
+    ports:
+      - target: 8080
+        published: 8090
+        mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 128M
+
+networks:
+  backend:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"               # tráfico entre nodos cifrado (IPSec) dentro de la red overlay
+
+volumes:
+  redis-data:
+
+configs:
+  edge_nginx_conf:
+    # Los configs de Swarm son inmutables: al cambiar nginx.conf se sube EDGE_CONF_VERSION
+    name: rys_edge_nginx_v${EDGE_CONF_VERSION:-1}
+    file: ./edge/nginx.conf
+
+secrets:
+  # Se crean una sola vez en el manager (scripts/05-desplegar-stack.sh) a partir de los
+  # secrets del pipeline; nunca se guardan en el repositorio.
+  rys_db_password:
+    external: true
+  rys_clinico_crypto_key:
+    external: true
+  rys_pagos_webhook_secret:
+    external: true
+  rys_origin_secret_map:
+    external: true

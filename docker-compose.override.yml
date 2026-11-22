@@ -1,0 +1,121 @@
+# =============================================================================
+#  Ajustes SOLO para desarrollo local con `docker compose up` (IE2).
+#  `docker stack deploy` no lee este archivo.
+#
+#  Supone los repositorios clonados uno al lado del otro:
+#     respirar-y-soltar-cloud/
+#       ├── ms-identidad/  ms-psicologos/  ms-agenda/ ... ms-notificaciones/
+#       └── rys-infraestructura/   ← aquí se ejecuta `docker compose up -d --build`
+#
+#  Diferencias con el clúster: PostgreSQL en un contenedor (en vez de RDS), 1 réplica,
+#  puertos 8081-8087 publicados para probar cada microservicio con Postman, los mismos
+#  secretos pero leídos desde archivos de desarrollo en ./local/ y sin la cola SQS
+#  (los eventos de ms-agenda van al log).
+# =============================================================================
+
+x-local: &local
+  deploy:
+    replicas: 1
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: respirar
+      POSTGRES_PASSWORD: respirar
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"                # 5433 en el equipo para no chocar con un PostgreSQL local
+    networks:
+      - backend
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U respirar"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    deploy:
+      placement: !reset {}
+
+  ms-identidad:
+    <<: *local
+    image: rys/ms-identidad:local
+    build: ../ms-identidad
+    ports: ["8081:8081"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  ms-psicologos:
+    <<: *local
+    image: rys/ms-psicologos:local
+    build: ../ms-psicologos
+    ports: ["8082:8082"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  ms-agenda:
+    <<: *local
+    image: rys/ms-agenda:local
+    build: ../ms-agenda
+    ports: ["8083:8083"]
+    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}}
+
+  ms-talleres:
+    <<: *local
+    image: rys/ms-talleres:local
+    build: ../ms-talleres
+    ports: ["8084:8084"]
+    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}}
+
+  ms-pagos:
+    <<: *local
+    image: rys/ms-pagos:local
+    build: ../ms-pagos
+    ports: ["8085:8085"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  ms-clinico:
+    <<: *local
+    image: rys/ms-clinico:local
+    build: ../ms-clinico
+    ports: ["8086:8086"]
+    environment:
+      CLINICO_PERMITIR_CLAVE_DESARROLLO: "true"
+    depends_on: {postgres: {condition: service_healthy}}
+
+  ms-notificaciones:
+    <<: *local
+    image: rys/ms-notificaciones:local
+    build: ../ms-notificaciones
+    ports: ["8087:8087"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  edge:
+    deploy:
+      replicas: 1
+    ports: !override
+      - "8080:80"
+
+  visualizador:
+    profiles: ["solo-swarm"]       # no se levanta en local
+
+networks:
+  backend:                         # en local no hay Swarm: red bridge en vez de overlay
+    driver: bridge
+    driver_opts: !reset {}
+
+volumes:
+  postgres-data:
+
+# Secretos de DESARROLLO (no sirven en la nube): mismos nombres que en el clúster
+secrets:
+  rys_db_password: !override
+    file: ./local/db_password.txt
+  rys_clinico_crypto_key: !override
+    file: ./local/vacio.txt          # vacío → ms-clinico usa su clave de desarrollo
+  rys_pagos_webhook_secret: !override
+    file: ./local/vacio.txt          # vacío → el webhook local no exige firma
+  rys_origin_secret_map: !override
+    file: ./local/origen-local.conf
