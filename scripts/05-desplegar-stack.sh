@@ -28,7 +28,17 @@ crear_secreto rys_origin_secret_map "$(printf 'map $http_x_origin_verify $origen
 
 info "docker stack deploy (imágenes $REGISTRY/rys/*:$TAG)"
 en "$MANAGER" "cd ~/rys && aws ecr get-login-password --region $AWS_REGION | docker login -u AWS --password-stdin $REGISTRY >/dev/null \
-  && REGISTRY=$REGISTRY TAG=$TAG DB_HOST=$DB_HOST SQS_COLA_CITAS_URL=$COLA EDGE_CONF_VERSION=${EDGE_CONF_VERSION:-1} \
-     docker stack deploy -c docker-compose.yml --with-registry-auth --prune --detach=false rys"
-en "$MANAGER" 'docker stack services rys'
-ok "Stack desplegado"
+  && REGISTRY=$REGISTRY TAG=$TAG DB_HOST=$DB_HOST SQS_COLA_CITAS_URL=$COLA EDGE_CONF_VERSION=$(shasum "$RAIZ/edge/nginx.conf" | cut -c1-10) \
+     docker stack deploy -c docker-compose.yml --with-registry-auth --prune rys"
+
+info "Esperando que todas las réplicas queden corriendo (máx. 10 min)"
+en "$MANAGER" 'bash -s' <<'REMOTO'
+for i in $(seq 1 60); do
+  pendientes=$(docker stack services rys --format '{{.Name}} {{.Replicas}}' | awk '{split($2,r,"/"); if (r[1]!=r[2]) print $1" "$2}')
+  [ -z "$pendientes" ] && break
+  echo "  esperando: $(echo $pendientes | tr '\n' ' ')"; sleep 10
+done
+docker stack services rys
+[ -z "$pendientes" ]
+REMOTO
+ok "Stack desplegado y convergido"
