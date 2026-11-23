@@ -50,9 +50,30 @@ info "5 · Estado de la cola"
 aws sqs get-queue-attributes --queue-url "$COLA" --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --query Attributes --output text | sed 's/^/  pendientes, en proceso: /'
 
 if [[ -n "${CARGA:-}" ]]; then
-  info "6 · Carga: $CARGA reservas concurrentes (10 en paralelo)"
-  seq 1 "$CARGA" | xargs -P 10 -I{} sh -c "curl -s -o /dev/null -w '%{http_code}\n' -H 'x-api-key: $API_KEY' -H '$J' \
-    -X POST '$API_URL/agenda/api/citas' -d '{\"pacienteId\":\"$PACIENTE_ID\",\"psicologoId\":\"$PSICO_ID\",\"horario\":\"'\$(python3 -c \"import datetime as d; print((d.datetime(2027,1,1,8)+d.timedelta(hours={})).isoformat())\")'\"}'" \
-    | sort | uniq -c | sed 's/^/  respuestas HTTP: /'
+  info "6 · Carga: $CARGA reservas concurrentes (10 en paralelo) por el API Gateway"
+  RESP=$(mktemp)
+  # Horarios precalculados (uno por hora, desde 30 días más) para lanzar las peticiones sin demoras
+  HORARIOS=($(python3 -c "import datetime as d; b=(d.datetime.now()+d.timedelta(days=30)).replace(minute=0,second=0,microsecond=0); print(' '.join((b+d.timedelta(hours=i)).isoformat() for i in range(1,$CARGA+1)))"))
+  INI=$(python3 -c 'import time; print(time.time())')
+  for i in $(seq 0 $((CARGA - 1))); do
+    curl -s -o /dev/null -w '%{http_code} %{time_total}\n' -H "x-api-key: $API_KEY" -H "$J" -X POST "$API_URL/agenda/api/citas" \
+      -d "{\"pacienteId\":\"$PACIENTE_ID\",\"psicologoId\":\"$PSICO_ID\",\"horario\":\"${HORARIOS[$i]}\"}" >> "$RESP" &
+    (( (i + 1) % 10 == 0 )) && wait
+  done; wait
+  FIN=$(python3 -c 'import time; print(time.time())')
+  awk '{print $1}' "$RESP" | sort | uniq -c | sed 's/^/  respuestas HTTP: /'
+  sort -k2 -n "$RESP" | awk '{t[NR]=$2; s+=$2} END {printf "  tiempo de respuesta: promedio %.2f s · p50 %.2f s · p95 %.2f s · máximo %.2f s\n", s/NR, t[int(NR*0.5)], t[int(NR*0.95)], t[NR]}' 
+  echo "  $CARGA reservas en $(python3 -c "print(round($FIN-$INI,1))") s"
+  info "7 · La cola y la Lambda absorben el pico: confirmaciones de las $CARGA reservas"
+  for i in $(seq 1 60); do
+    N=$(api "$API_URL/notificaciones/api/notificaciones?destinatario=camila.$SUFIJO@correo.cl" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+    EN_COLA=$(aws sqs get-queue-attributes --queue-url "$COLA" --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible]' --output text | tr '\t' '/')
+    echo "  $(date +%T)  notificaciones enviadas: $N de $((CARGA + 1))   cola (pendientes/en proceso): $EN_COLA"
+    [[ "$N" -ge $((CARGA + 1)) ]] && break; sleep 5
+  done
+  DLQ=$(aws sqs get-queue-url --queue-name "${PROYECTO}-citas-eventos-dlq" --query QueueUrl --output text)
+  echo "  mensajes en la DLQ: $(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names ApproximateNumberOfMessages --query Attributes.ApproximateNumberOfMessages --output text)"
+  echo "  total de confirmaciones en $(python3 -c "import time; print(round(time.time()-$INI,1))") s desde la primera reserva"
+  rm -f "$RESP"
 fi
 ok "Flujo completo verificado"
