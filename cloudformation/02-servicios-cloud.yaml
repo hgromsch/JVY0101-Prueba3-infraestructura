@@ -49,11 +49,17 @@ Resources:
 
   BaseDatos:
     Type: AWS::RDS::DBInstance
+    Metadata:
+      cfn-lint:
+        config:
+          # La clave llega desde el secret DB_PASSWORD del pipeline (parametro NoEcho). En AWS Academy
+          # se evita Secrets Manager; en produccion: ManageMasterUserPassword o referencia dinamica.
+          ignore_checks: [W1011]
     DeletionPolicy: Delete                # laboratorio; en produccion: Snapshot
     Properties:
       DBInstanceIdentifier: !Sub "${Proyecto}-postgres"
       Engine: postgres
-      EngineVersion: "16"
+      EngineVersion: "16.13"              # version exacta (la mayor sola, "16", esta deprecada para crear)
       DBInstanceClass: !Ref DbClase
       AllocatedStorage: "20"
       StorageType: gp3
